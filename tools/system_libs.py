@@ -503,13 +503,13 @@ def calculate(temp_files, in_temp, stdout_, stderr_, forced=[]):
   # You can provide 1 to include everything, or a comma-separated list with the ones you want
   force = os.environ.get('EMCC_FORCE_STDLIBS')
   force_all = force == '1'
-  force = set((force.split(',') if force else []) + forced)
-  if force:
-    logging.debug('forcing stdlibs: ' + str(force))
+  force_include = set((force.split(',') if force else []) + forced)
+  if force_include:
+    logging.debug('forcing stdlibs: ' + str(force_include))
 
   # Set of libraries to include on the link line, as opposed to `force` which
   # is the set of libraries to force include (with --whole-archive).
-  include = set()
+  alwasy_include = set()
 
   # Setting this will only use the forced libs in EMCC_FORCE_STDLIBS. This avoids spending time checking
   # for unresolved symbols in your project files, which can speed up linking, but if you do not have
@@ -579,11 +579,11 @@ def calculate(temp_files, in_temp, stdout_, stderr_, forced=[]):
     libc_deps += ['wasm-libc']
   if shared.Settings.USE_PTHREADS:
     libc_name = 'libc-mt'
-    include.add('pthreads')
-    include.add('pthreads_asmjs')
-  include.add(malloc_name())
+    alwasy_include.add('pthreads')
+    alwasy_include.add('pthreads_asmjs')
+  alwasy_include.add(malloc_name())
   if shared.Settings.WASM_BACKEND:
-    include.add('compiler-rt')
+    alwasy_include.add('compiler-rt')
 
   Library = namedtuple('Library', ['shortname', 'suffix', 'create', 'symbols', 'deps', 'can_noexcept'])
 
@@ -608,8 +608,8 @@ def calculate(temp_files, in_temp, stdout_, stderr_, forced=[]):
   # Add libc-extras at the end, as libc may end up requiring them, and they depend on nothing.
   system_libs.append(Library('libc-extras', ext, create_libc_extras, libc_extras_symbols, [], False))
 
-  ret = []
-  included = set()
+  libs_to_link = []
+  already_included = set()
 
   def maybe_noexcept(name):
     if shared.Settings.DISABLE_EXCEPTION_CATCHING:
@@ -619,9 +619,9 @@ def calculate(temp_files, in_temp, stdout_, stderr_, forced=[]):
   system_libs_map = {l.shortname: l for l in system_libs}
 
   def add_library(lib):
-    if lib.shortname in included:
+    if lib.shortname in already_included:
       return
-    included.add(lib.shortname)
+    already_included.add(lib.shortname)
 
     shortname = lib.shortname
     if lib.can_noexcept:
@@ -634,8 +634,8 @@ def calculate(temp_files, in_temp, stdout_, stderr_, forced=[]):
       return lib.create(name)
 
     libfile = shared.Cache.get(name, do_create, extension=lib.suffix)
-    need_whole_archive = lib.shortname in force and lib.suffix != 'bc'
-    ret.append((libfile, need_whole_archive))
+    need_whole_archive = lib.shortname in force_include and lib.suffix != 'bc'
+    libs_to_link.append((libfile, need_whole_archive))
 
     # Recursively add dependencies
     for d in lib.deps:
@@ -643,12 +643,12 @@ def calculate(temp_files, in_temp, stdout_, stderr_, forced=[]):
 
   # Go over libraries to figure out which we must include
   for lib in system_libs:
-    if lib.shortname in included:
+    if lib.shortname in already_included:
       continue
-    force_this = lib.shortname in force
+    force_this = lib.shortname in force_include
     if not force_this and only_forced:
       continue
-    include_this = force_this or lib.shortname in include
+    include_this = force_this or lib.shortname in alwasy_include
 
     if not include_this:
       need_syms = set()
@@ -674,31 +674,31 @@ def calculate(temp_files, in_temp, stdout_, stderr_, forced=[]):
     add_library(lib)
 
   if shared.Settings.WASM_BACKEND:
-    ret.append((shared.Cache.get('wasm_compiler_rt.a', lambda: create_wasm_compiler_rt('wasm_compiler_rt.a'), extension='a'), False))
-    ret.append((shared.Cache.get('wasm_libc_rt.a', lambda: create_wasm_libc_rt('wasm_libc_rt.a'), extension='a'), False))
+    libs_to_link.append((shared.Cache.get('wasm_compiler_rt.a', lambda: create_wasm_compiler_rt('wasm_compiler_rt.a'), extension='a'), False))
+    libs_to_link.append((shared.Cache.get('wasm_libc_rt.a', lambda: create_wasm_libc_rt('wasm_libc_rt.a'), extension='a'), False))
 
-  ret.sort(key=lambda x: x[0].endswith('.a')) # make sure to put .a files at the end.
+  libs_to_link.sort(key=lambda x: x[0].endswith('.a')) # make sure to put .a files at the end.
 
   # libcxxabi and libcxx *static* linking is tricky. e.g. cxa_demangle.cpp disables c++
   # exceptions, but since the string methods in the headers are *weakly* linked, then
   # we might have exception-supporting versions of them from elsewhere, and if libcxxabi
   # is first then it would "win", breaking exception throwing from those string
   # header methods. To avoid that, we link libcxxabi last.
-  ret.sort(key=lambda x: x[0].endswith('libcxxabi.bc'))
+  libs_to_link.sort(key=lambda x: x[0].endswith('libcxxabi.bc'))
 
   # Wrap libraries in --whole-archive, as needed.  We need to do this last
   # since otherwise the abort sorting won't make sense.
   if force_all:
-    final = ['--whole-archive'] + [r[0] for r in ret] + ['--no-whole-archive']
+    ret = ['--whole-archive'] + [r[0] for r in libs_to_link] + ['--no-whole-archive']
   else:
-    final = []
-    for name, need_whole_archive in ret:
+    ret = []
+    for name, need_whole_archive in libs_to_link:
       if need_whole_archive:
-        final += ['--whole-archive', name, '--no-whole-archive']
+        ret += ['--whole-archive', name, '--no-whole-archive']
       else:
-        final.append(name)
+        ret.append(name)
 
-  return final
+  return ret
 
 
 class Ports(object):
